@@ -8,7 +8,7 @@ use pneumatic_core::config::Config;
 use pneumatic_core::{conns, messages, server, node::*, transactions::*};
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
-use pneumatic_core::tokens::{BlockValidationResult, Token};
+use pneumatic_core::tokens::{BlockCommitInfo, BlockValidationResult, Token};
 use crate::actions::ActionRouter;
 
 pub struct Committer {
@@ -66,10 +66,8 @@ impl Committer {
     }
 
     pub fn handle_commit(&self, commit: TransactionCommit) {
-        let metadata = match &self.config.environment_metadata.get(&commit.env_id) {
-            None => return,
-            Some(md) => md
-        };
+        let Some(metadata) = &self.config.environment_metadata.get(&commit.env_id)
+            else { return };
 
         // TODO: have to pass correct args here
         if !metadata.asym_crypto_provider.check_signature(vec![], vec![], vec![]) {
@@ -96,12 +94,18 @@ impl Committer {
                 return
             }
             BlockValidationResult::Ok => {
-                let is_archiver = self.config.node_registry_types
-                    .contains(&NodeRegistryType::Archiver);
+                self.router.distribute_token(locked_token.clone());
 
-                // TODO: commit block (w/ full data if Archiver)
+                let commit_info = BlockCommitInfo {
+                    token_id: commit.token_id.clone(),
+                    env_id: commit.env_id.clone(),
+                    is_archiver: self.config.node_registry_types
+                        .contains(&NodeRegistryType::Archiver),
+                    env_slush_partition: metadata.slush_partition_id.clone(),
+                    trans_data: commit
+                };
 
-                self.router.distribute_token(locked_token);
+                Token::commit_block(locked_token, commit_info);
             }
         }
     }
@@ -132,21 +136,4 @@ impl Committer {
 //         spec.LoadSpec(metadata, this);
 //
 //         return await spec.Validate(block);
-//     }
-//
-//     public async Task CommitBlock(BlockCommitInfo info)
-//     {
-//         if (Chain == null) return;
-//         if (Chain.Count == HashSecurityLevel && !info.IsArchiver)
-//             Chain.RemoveBlock();
-//
-//         Chain.AddBlock(info.ProposedBlock);
-//
-//         // save the updated token
-//         await info.Metadata.DataProvider.PersistToken(this);
-//
-//         // save the transaction commit result
-//         // TODO: save the transaction metadata (finalizer, executors, total fuel used, etc)
-//         // TODO: for adding up all rewards at the end of epoch
-//         await info.Metadata.DataProvider.SaveData(info.Result.TokenId, info.Result.Data);
 //     }
