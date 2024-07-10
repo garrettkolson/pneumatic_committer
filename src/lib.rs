@@ -2,12 +2,13 @@ pub mod actions;
 
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::{Arc, RwLock};
 use pneumatic_core::config::Config;
-use pneumatic_core::{conns, messages, server};
+use pneumatic_core::{conns, messages, server, node::*, transactions::*};
+use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
-use pneumatic_core::node::*;
-use pneumatic_core::transactions::*;
+use pneumatic_core::tokens::{BlockValidationResult, Token};
 use crate::actions::ActionRouter;
 
 pub struct Committer {
@@ -46,12 +47,17 @@ impl Committer {
                 Ok(mut stream) => {
                     let clone = committer.clone();
                     let _ = thread_pool.execute(move || {
-                        stream.write_all(&messages::acknowledge()).ok();
                         let buf_reader = BufReader::new(&mut stream);
                         let raw_data = buf_reader.buffer().to_vec();
-                        let Ok(commit) = deserialize_rmp_to::<TransactionCommit>(&raw_data)
-                            else { return };
+                        let commit = match deserialize_rmp_to::<TransactionCommit>(&raw_data) {
+                            Ok(c) => c,
+                            Err(_) => {
+                                stream.write_all(&messages::acknowledge()).ok();
+                                return;
+                            }
+                        };
 
+                        stream.write_all(&messages::acknowledge()).ok();
                         clone.handle_commit(commit);
                     });
                 }
@@ -60,77 +66,87 @@ impl Committer {
     }
 
     pub fn handle_commit(&self, commit: TransactionCommit) {
+        let metadata = match &self.config.environment_metadata.get(&commit.env_id) {
+            None => return,
+            Some(md) => md
+        };
 
+        // TODO: have to pass correct args here
+        if !metadata.asym_crypto_provider.check_signature(vec![], vec![], vec![]) {
+            return;
+        }
+
+        let locked_token = match DataProvider::get_token(&commit.token_id, &metadata.token_partition_id) {
+            Ok(token) => token,
+            Err(DataError::DataNotFound) => {
+                // TODO: mint new token
+                Arc::new(RwLock::new(Token::new()))
+            },
+            _ => return
+        };
+
+        let Ok(token) = locked_token.read() else {
+            // TODO: log this error
+            return
+        };
+
+        match token.validate_block(&commit.proposed_block, &metadata) {
+            BlockValidationResult::Err(error) => {
+                // TODO: log this error
+                return
+            }
+            BlockValidationResult::Ok => {
+                let is_archiver = self.config.node_registry_types
+                    .contains(&NodeRegistryType::Archiver);
+
+                // TODO: commit block (w/ full data if Archiver)
+
+                self.router.distribute_token(locked_token);
+            }
+        }
     }
 }
-
-//use std::sync::Arc;
-// use dashmap::mapref::entry::{OccupiedEntry, VacantEntry};
-// use dashmap::mapref::entry::Entry::{Occupied, Vacant};
-// use serde_json::error::Category::Data;
-// use crate::config::Config;
-// use crate::data::crypto::{AsymCryptoProviderType, RsaCryptoProvider};
-// use crate::data::encoding::DataSerializer;
-// use crate::message::Message;
-// use crate::node_functions::IsNodeFunction;
-// use crate::node_functions::server::ActionRouter;
-// use crate::transactions::TransactionCommit;
-//
-// // TODO: can we try to make all the node functions stateless?
-//
-// pub struct Committer {
-//
-// }
 //
 // impl Committer {
-//     // pub fn new(
-//     //     config: &Config,
-//     //     router: Arc<ActionRouter>) -> Committer {
-//     //     Committer {}
-//     // }
+//             var validationResult = await token.ValidateBlock(proposedBlock, metadata);
 //
-//     pub async fn handle_data_received(config: &Config, router: &Arc<ActionRouter>, data: Vec<u8>) {
-//         let message = match DataSerializer::deserialize_rmp_to::<Message>(data) {
-//             Err(_) => return,
-//             Ok(message) => message
-//         };
-//
-//         let metadata_arc = Arc::clone(&config.environment_metadata);
-//         let entry = match metadata_arc.entry(message.chain_id.to_string()) {
-//             Vacant(vacant) => return,
-//             Occupied(entry) => entry
-//         };
-//
-//         let env_metadata = entry.get();
-//         let sig_is_valid = match env_metadata.asym_crypto_provider_type {
-//             AsymCryptoProviderType::RSA => RsaCryptoProvider::message_has_valid_signature(&message)
-//         };
-//
-//         if !sig_is_valid { return; }
-//         if let Ok(commit) = DataSerializer::deserialize_rmp_to::<TransactionCommit>(message.body) {
-//             // TODO: figure out how to get the underlying asset for a new token (probably have to pass it in with the transaction)
-//             // var token = await metadata.DataProvider.GetTokenAsync<IToken>(result.TokenId) ??
-//             //      await TokenFactory.MintToken(new object());
-//             // var validationResult = await _blockServices.ValidateBlock(token, proposedBlock, metadata);
-//             //
-//             // if (validationResult.BlockIsValid)
-//             // {
-//             //     await _blockServices.CommitBlock(token, metadata, proposedBlock, result);
-//             //     await _tokenDistributor.Distribute(token);
-//             // }
-//             // else
-//             //      // save validation result for reconciliation at epoch end
-//             //      await _blockServices.QueueBlockForReconciliation(validationResult, metadata);
+//             if (validationResult.BlockIsValid)
+//             {
+//                 var isArchiver = _nodeConfig.NodeFunctionTypes.Any(type => type == NodeRegistryType.Archiver);
+//                 BlockCommitInfo commitInfo = new(metadata, proposedBlock, result, isArchiver);
+//                 await token.CommitBlock(commitInfo);
+//                 await _tokenDistributor.Distribute(token);
+//             }
+//             else
+//                 // save validation result for reconciliation at epoch end
+//                 await _blockServices.QueueBlockForReconciliation(validationResult, metadata);
 //         }
 //     }
 // }
+// // TODO: could have self-signed non-Pneuma tokens if they pay fuel for sentinel/committal fees?
+//     public async Task<BlockValidationResult> ValidateBlock(Block block, EnvironmentMetadata metadata)
+//     {
+//         if (!metadata.BlockValidatorSpecs.TryGetValue(BlockValidationSpecName, out var spec))
+//             spec = new ExecutedBlockValidatorSpec();
 //
-// // impl IsNodeFunction for Committer {
-// //     fn initialize(&mut self) {
-// //         todo!()
-// //     }
-// //
-// //     fn handle_data_received(&mut self, data: Vec<u8>) {
-// //         todo!()
-// //     }
-// // }
+//         spec.LoadSpec(metadata, this);
+//
+//         return await spec.Validate(block);
+//     }
+//
+//     public async Task CommitBlock(BlockCommitInfo info)
+//     {
+//         if (Chain == null) return;
+//         if (Chain.Count == HashSecurityLevel && !info.IsArchiver)
+//             Chain.RemoveBlock();
+//
+//         Chain.AddBlock(info.ProposedBlock);
+//
+//         // save the updated token
+//         await info.Metadata.DataProvider.PersistToken(this);
+//
+//         // save the transaction commit result
+//         // TODO: save the transaction metadata (finalizer, executors, total fuel used, etc)
+//         // TODO: for adding up all rewards at the end of epoch
+//         await info.Metadata.DataProvider.SaveData(info.Result.TokenId, info.Result.Data);
+//     }
