@@ -1,23 +1,66 @@
 pub mod actions;
 
+use std::io::{BufReader, Write};
+use std::net::{SocketAddr, TcpListener};
 use std::sync::Arc;
 use pneumatic_core::config::Config;
+use pneumatic_core::{conns, messages, server};
+use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::node::*;
+use pneumatic_core::transactions::*;
 use crate::actions::ActionRouter;
 
 pub struct Committer {
     config: Config,
-    router: ActionRouter,
+    router: Arc<ActionRouter>,
     registry: Arc<NodeRegistry>
 }
 
 impl Committer {
-    pub fn init(config: Config, router: ActionRouter, registry: Arc<NodeRegistry>) -> Self {
+    const BLOCK_LISTENER_THREAD_COUNT: usize = 10;
+
+    pub fn init(config: Config, router: Arc<ActionRouter>, registry: Arc<NodeRegistry>) -> Self {
         Committer {
             config,
             router,
             registry
         }
+    }
+
+    pub fn listen_for_new_blocks(router: Arc<ActionRouter>, registry: Arc<NodeRegistry>) {
+        let config = Config::build()
+            .expect("Couldn't build config for committer");
+
+        let ip = config.ip_address;
+        let addr = SocketAddr::new(ip, conns::COMMITTER_PORT);
+        let listener = TcpListener::bind(addr)
+            .expect("Couldn't set up external TCP listener for new blocks");
+        let thread_pool = server::ThreadPool::build(Self::BLOCK_LISTENER_THREAD_COUNT)
+            .expect("Couldn't establish thread pool for committing new blocks");
+
+        let committer = Arc::new(Committer::init(config, router, registry));
+
+        for stream in listener.incoming() {
+            let _ = match stream {
+                Err(_) => continue,
+                Ok(mut stream) => {
+                    let clone = committer.clone();
+                    let _ = thread_pool.execute(move || {
+                        stream.write_all(&messages::acknowledge()).ok();
+                        let buf_reader = BufReader::new(&mut stream);
+                        let raw_data = buf_reader.buffer().to_vec();
+                        let Ok(commit) = deserialize_rmp_to::<TransactionCommit>(&raw_data)
+                            else { return };
+
+                        clone.handle_commit(commit);
+                    });
+                }
+            };
+        }
+    }
+
+    pub fn handle_commit(&self, commit: TransactionCommit) {
+
     }
 }
 
