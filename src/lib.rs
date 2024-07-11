@@ -8,7 +8,9 @@ use pneumatic_core::config::Config;
 use pneumatic_core::{conns, messages, server, node::*, transactions::*};
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
-use pneumatic_core::tokens::{BlockCommitInfo, BlockValidationResult, Token};
+use pneumatic_core::environment::EnvironmentMetadata;
+use pneumatic_core::messages::Message;
+use pneumatic_core::tokens::*;
 use crate::actions::ActionRouter;
 
 pub struct Committer {
@@ -49,7 +51,7 @@ impl Committer {
                     let _ = thread_pool.execute(move || {
                         let buf_reader = BufReader::new(&mut stream);
                         let raw_data = buf_reader.buffer().to_vec();
-                        let commit = match deserialize_rmp_to::<TransactionCommit>(&raw_data) {
+                        let message = match deserialize_rmp_to::<Message>(&raw_data) {
                             Ok(c) => c,
                             Err(_) => {
                                 stream.write_all(&messages::acknowledge()).ok();
@@ -58,41 +60,32 @@ impl Committer {
                         };
 
                         stream.write_all(&messages::acknowledge()).ok();
-                        clone.handle_commit(commit);
+                        let _ = match clone.handle_commit(message) {
+                            Ok(()) => return,
+                            Err(err) => return // TODO: log error
+                        };
                     });
                 }
             };
         }
     }
 
-    pub fn handle_commit(&self, commit: TransactionCommit) {
-        let Some(metadata) = &self.config.environment_metadata.get(&commit.env_id)
-            else { return };
+    pub fn handle_commit(&self, message: Message) -> Result<(), CommitterError> {
+        let Some(metadata) = &self.config.environment_metadata.get(&message.chain_id)
+            else { return Err(CommitterError::MissingEnvironmentMetadata(message.chain_id)) };
 
-        // TODO: have to pass correct args here
-        if !metadata.asym_crypto_provider.check_signature(vec![], vec![], vec![]) {
-            return;
-        }
+        let commit = Self::validate_transaction_message(&message, &metadata)?;
+        let locked_token = Self::acquire_token(&commit, &metadata)?;
 
-        let locked_token = match DataProvider::get_token(&commit.token_id, &metadata.token_partition_id) {
-            Ok(token) => token,
-            Err(DataError::DataNotFound) => {
-                // TODO: mint new token
-                Arc::new(RwLock::new(Token::new()))
-            },
-            _ => return
-        };
-
-        let Ok(token) = locked_token.read() else {
-            // TODO: log this error
-            return
-        };
+        let token_clone = locked_token.clone();
+        let Ok(token) = token_clone.read()
+            else { return Err(CommitterError::TokenPoisoned) };
 
         match token.validate_block(&commit.proposed_block, &metadata) {
             BlockValidationResult::Err(error) => {
-                // TODO: log this error
-                return
-            }
+                // TODO: queue block for reconciliation at end of epoch
+                Err(CommitterError::FromValidationError(error))
+            },
             BlockValidationResult::Ok => {
                 self.router.distribute_token(locked_token.clone());
 
@@ -105,35 +98,49 @@ impl Committer {
                     trans_data: commit
                 };
 
-                Token::commit_block(locked_token, commit_info);
+                Token::commit_block(locked_token, commit_info)
+                    .or_else(|err| Err(CommitterError::FromCommitError(err)))
             }
         }
     }
+
+    fn validate_transaction_message(message: &Message, metadata: &EnvironmentMetadata)
+            -> Result<TransactionCommit, CommitterError> {
+        let crypto_provider = match metadata.asym_crypto_provider.lock() {
+            Ok(provider) => provider,
+            Err(_) => return Err(CommitterError::CryptoProviderPoisoned)
+        };
+
+        if !crypto_provider.check_signature(&message.signature, &message.body) {
+            return Err(CommitterError::InvalidSignature);
+        }
+
+        match deserialize_rmp_to::<TransactionCommit>(&message.body) {
+            Ok(commit) => Ok(commit),
+            Err(_) => Err(CommitterError::MalformedTransactionData)
+        }
+    }
+
+    fn acquire_token(commit: &TransactionCommit, metadata: &EnvironmentMetadata)
+            -> Result<Arc<RwLock<Token>>, CommitterError> {
+        match DataProvider::get_token(&commit.token_id, &metadata.token_partition_id) {
+            Ok(token) => Ok(token),
+            Err(DataError::DataNotFound) => {
+                // TODO: mint new token
+                Ok(Arc::new(RwLock::new(Token::new())))
+            },
+            Err(err) => Err(CommitterError::FromDataError(err))
+        }
+    }
 }
-//
-// impl Committer {
-//             var validationResult = await token.ValidateBlock(proposedBlock, metadata);
-//
-//             if (validationResult.BlockIsValid)
-//             {
-//                 var isArchiver = _nodeConfig.NodeFunctionTypes.Any(type => type == NodeRegistryType.Archiver);
-//                 BlockCommitInfo commitInfo = new(metadata, proposedBlock, result, isArchiver);
-//                 await token.CommitBlock(commitInfo);
-//                 await _tokenDistributor.Distribute(token);
-//             }
-//             else
-//                 // save validation result for reconciliation at epoch end
-//                 await _blockServices.QueueBlockForReconciliation(validationResult, metadata);
-//         }
-//     }
-// }
-// // TODO: could have self-signed non-Pneuma tokens if they pay fuel for sentinel/committal fees?
-//     public async Task<BlockValidationResult> ValidateBlock(Block block, EnvironmentMetadata metadata)
-//     {
-//         if (!metadata.BlockValidatorSpecs.TryGetValue(BlockValidationSpecName, out var spec))
-//             spec = new ExecutedBlockValidatorSpec();
-//
-//         spec.LoadSpec(metadata, this);
-//
-//         return await spec.Validate(block);
-//     }
+
+pub enum CommitterError {
+    MissingEnvironmentMetadata(String),
+    InvalidSignature,
+    CryptoProviderPoisoned,
+    TokenPoisoned,
+    FromDataError(DataError),
+    MalformedTransactionData,
+    FromValidationError(BlockValidationError),
+    FromCommitError(BlockCommitError)
+}
