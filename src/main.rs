@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::thread;
+use pneumatic_core::data::{DataProvider, DefaultDataProvider};
 use pneumatic_core::node::{NodeRegistry, NodeRegistryType};
 use pneumatic_committer::actions::ActionRouter;
 use pneumatic_committer::Committer;
@@ -17,8 +18,9 @@ fn main() {
         ActionRouter::listen_for_registrations(registering_router);
     });
 
+    let data_provider: Arc<Box<dyn DataProvider>> = Arc::new(Box::new(DefaultDataProvider {}));
     let blocks_thread = thread::spawn(move || {
-        Committer::listen_for_new_blocks(router, registry);
+        Committer::listen_for_new_blocks(router, registry, data_provider);
     });
 
     let _ = updates_thread.join();

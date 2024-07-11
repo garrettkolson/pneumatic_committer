@@ -1,7 +1,7 @@
 pub mod actions;
 
 use std::io::{BufReader, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 use pneumatic_core::config::Config;
@@ -10,27 +10,35 @@ use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::deserialize_rmp_to;
 use pneumatic_core::environment::EnvironmentMetadata;
 use pneumatic_core::messages::Message;
+use pneumatic_core::server::ThreadPool;
 use pneumatic_core::tokens::*;
 use crate::actions::ActionRouter;
 
 pub struct Committer {
     config: Config,
     router: Arc<ActionRouter>,
-    registry: Arc<NodeRegistry>
+    registry: Arc<NodeRegistry>,
+    data_provider: Arc<Box<dyn DataProvider>>
 }
 
 impl Committer {
     const BLOCK_LISTENER_THREAD_COUNT: usize = 10;
 
-    pub fn init(config: Config, router: Arc<ActionRouter>, registry: Arc<NodeRegistry>) -> Self {
+    pub fn init(config: Config,
+                router: Arc<ActionRouter>,
+                registry: Arc<NodeRegistry>,
+                data_provider: Arc<Box<dyn DataProvider>>) -> Self {
         Committer {
             config,
             router,
-            registry
+            registry,
+            data_provider
         }
     }
 
-    pub fn listen_for_new_blocks(router: Arc<ActionRouter>, registry: Arc<NodeRegistry>) {
+    pub fn listen_for_new_blocks(router: Arc<ActionRouter>,
+                                 registry: Arc<NodeRegistry>,
+                                 data_provider: Arc<Box<dyn DataProvider>>) {
         let config = Config::build()
             .expect("Couldn't build config for committer");
 
@@ -41,46 +49,51 @@ impl Committer {
         let thread_pool = server::ThreadPool::build(Self::BLOCK_LISTENER_THREAD_COUNT)
             .expect("Couldn't establish thread pool for committing new blocks");
 
-        let committer = Arc::new(Committer::init(config, router, registry));
+        let committer = Arc::new(Committer::init(config, router, registry, data_provider));
 
         for stream in listener.incoming() {
             let _ = match stream {
                 Err(_) => continue,
                 Ok(mut stream) => {
                     let clone = committer.clone();
-                    let _ = thread_pool.execute(move || {
-                        let buf_reader = BufReader::new(&mut stream);
-                        let raw_data = buf_reader.buffer().to_vec();
-                        let message = match deserialize_rmp_to::<Message>(&raw_data) {
-                            Ok(c) => c,
-                            Err(_) => {
-                                stream.write_all(&messages::acknowledge()).ok();
-                                return;
-                            }
-                        };
-
-                        stream.write_all(&messages::acknowledge()).ok();
-                        let _ = match clone.handle_commit(message) {
-                            Ok(()) => return,
-                            Err(err) => return // TODO: log error
-                        };
-                    });
+                    Self::process_incoming_block(stream, clone, &thread_pool);
                 }
             };
         }
     }
 
-    pub fn handle_commit(&self, message: Message) -> Result<(), CommitterError> {
+    fn process_incoming_block(mut stream: TcpStream, committer: Arc<Committer>, pool: &ThreadPool) {
+        let _ = pool.execute(move || {
+            let buf_reader = BufReader::new(&stream);
+            let raw_data = buf_reader.buffer().to_vec();
+            let message = match deserialize_rmp_to::<Message>(&raw_data) {
+                Ok(c) => c,
+                Err(_) => {
+                    stream.write_all(&messages::acknowledge()).ok();
+                    return;
+                }
+            };
+
+            stream.write_all(&messages::acknowledge()).ok();
+            let _ = match committer.validate_block_and_commit(message) {
+                Ok(()) => return,
+                Err(err) => return // TODO: log error
+            };
+        });
+    }
+
+    fn validate_block_and_commit(&self, message: Message) -> Result<(), CommitterError> {
         let Some(metadata) = &self.config.environment_metadata.get(&message.chain_id)
             else { return Err(CommitterError::MissingEnvironmentMetadata(message.chain_id)) };
 
         let commit = Self::validate_transaction_message(&message, &metadata)?;
-        let locked_token = Self::acquire_token(&commit, &metadata)?;
+        let locked_token = self.acquire_token(&commit, &metadata)?;
 
         let token_clone = locked_token.clone();
         let Ok(token) = token_clone.read()
             else { return Err(CommitterError::TokenPoisoned) };
 
+        // TODO: refactor this
         match token.validate_block(&commit.proposed_block, &metadata) {
             BlockValidationResult::Err(error) => {
                 // TODO: queue block for reconciliation at end of epoch
@@ -98,8 +111,7 @@ impl Committer {
                     trans_data: commit
                 };
 
-                Token::commit_block(locked_token, commit_info)
-                    .or_else(|err| Err(CommitterError::FromCommitError(err)))
+                self.commit_block(locked_token, commit_info)
             }
         }
     }
@@ -121,9 +133,9 @@ impl Committer {
         }
     }
 
-    fn acquire_token(commit: &TransactionCommit, metadata: &EnvironmentMetadata)
+    fn acquire_token(&self, commit: &TransactionCommit, metadata: &EnvironmentMetadata)
             -> Result<Arc<RwLock<Token>>, CommitterError> {
-        match DataProvider::get_token(&commit.token_id, &metadata.token_partition_id) {
+        match self.data_provider.get_token(&commit.token_id, &metadata.token_partition_id) {
             Ok(token) => Ok(token),
             Err(DataError::DataNotFound) => {
                 // TODO: mint new token
@@ -131,6 +143,12 @@ impl Committer {
             },
             Err(err) => Err(CommitterError::FromDataError(err))
         }
+    }
+
+    fn commit_block(&self, locked_token: Arc<RwLock<Token>>, block_info: BlockCommitInfo)
+            -> Result<(), CommitterError> {
+        Token::commit_block(locked_token, block_info)
+            .or_else(|err| Err(CommitterError::FromCommitError(err)))
     }
 }
 
