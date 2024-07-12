@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::thread;
+use pneumatic_core::conns::{ConnFactory, TcpConnFactory};
 use pneumatic_core::data::{DataProvider, DefaultDataProvider};
 use pneumatic_core::node::{NodeRegistry, NodeRegistryType};
 use pneumatic_committer::actions::ActionRouter;
@@ -19,8 +20,9 @@ fn main() {
     });
 
     let data_provider: Arc<Box<dyn DataProvider>> = Arc::new(Box::new(DefaultDataProvider {}));
+    let conn_factory: Arc<Box<dyn ConnFactory>> = Arc::new(Box::new(TcpConnFactory::new()));
     let blocks_thread = thread::spawn(move || {
-        Committer::listen_for_new_blocks(router, registry, data_provider);
+        Committer::listen_for_new_blocks(router, registry, data_provider, conn_factory);
     });
 
     let _ = updates_thread.join();
