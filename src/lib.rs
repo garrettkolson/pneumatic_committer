@@ -79,8 +79,11 @@ impl Committer {
                 }
             };
 
+            // TODO: have to have a pending transactions DashMap to make sure we haven't already processed this transaction
+
+            committer.registry.send_to_all(data, &NodeRegistryType::Committer);
             stream.write_all(&messages::acknowledge()).ok();
-            // TODO: pass this message to all known committers via NodeRegistry
+
             let _ = match committer.validate_block_and_commit(message) {
                 Ok(()) => return,
                 Err(err) => return // TODO: log error

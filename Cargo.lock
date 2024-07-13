@@ -449,7 +449,7 @@ dependencies = [
 [[package]]
 name = "pneumatic_core"
 version = "0.1.0"
-source = "git+https://github.com/garrettkolson/pneumatic_core.git#9e3fdf70d2a63304a5270978d748d7f86311148e"
+source = "git+https://github.com/garrettkolson/pneumatic_core.git#fef5382f83f077a43b1e435c68f67b414d42c753"
 dependencies = [
  "chrono",
  "dashmap",

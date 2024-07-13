@@ -7,7 +7,8 @@ use pneumatic_committer::actions::ActionRouter;
 use pneumatic_committer::Committer;
 
 fn main() {
-    let registry = Arc::new(NodeRegistry::init());
+    let registry_conn_factory: Box<dyn ConnFactory> = Box::new(TcpConnFactory::new());
+    let registry = Arc::new(NodeRegistry::init(registry_conn_factory));
     let updates_registry = registry.clone();
     let updates_thread = thread::spawn(move || {
         NodeRegistry::listen_for_updates(updates_registry, &NodeRegistryType::Committer);
