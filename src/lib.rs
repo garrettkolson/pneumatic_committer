@@ -1,29 +1,30 @@
 pub mod actions;
 
-use std::io::{Read, Write};
+use std::error::Error;
+use std::fmt::{Debug, Display, Formatter};
 use std::net::{SocketAddr};
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
+use dashmap::{DashSet};
 use pneumatic_core::config::Config;
-use pneumatic_core::{conns, messages, server, node::*, transactions::*};
+use pneumatic_core::{conns, logging::*, messages::*, server::*, node::*, tokens::*, transactions::*};
 use pneumatic_core::blocks::Block;
 use pneumatic_core::conns::{ConnFactory, Stream};
 use pneumatic_core::data::{DataError, DataProvider};
 use pneumatic_core::encoding::{deserialize_rmp_to, serialize_to_bytes_rmp};
 use pneumatic_core::environment::EnvironmentMetadata;
-use pneumatic_core::messages::Message;
-use pneumatic_core::server::ThreadPool;
-use pneumatic_core::tokens::*;
 use crate::actions::ActionRouter;
 
 const BLOCK_LISTENER_THREAD_COUNT: usize = 10;
 
 pub struct Committer {
     config: Config,
-    router: Arc<ActionRouter>,
-    registry: Arc<NodeRegistry>,
+    router: Arc<ActionRouter>,      // TODO: have to make a trait for this to properly mock
+    registry: Arc<NodeRegistry>,    // TODO: have to make a trait for this to properly mock
     data_provider: Arc<Box<dyn DataProvider>>,
-    conn_factory: Arc<Box<dyn ConnFactory>>
+    conn_factory: Arc<Box<dyn ConnFactory>>,
+    logger: Arc<Box<dyn Logger>>,
+    pending_transactions: Arc<DashSet<Vec<u8>>>
 }
 
 impl Committer {
@@ -31,35 +32,40 @@ impl Committer {
                 router: Arc<ActionRouter>,
                 registry: Arc<NodeRegistry>,
                 data_provider: Arc<Box<dyn DataProvider>>,
-                conn_factory: Arc<Box<dyn ConnFactory>>) -> Self {
+                conn_factory: Arc<Box<dyn ConnFactory>>,
+                logger: Arc<Box<dyn Logger>>) -> Self {
         Committer {
             config,
             router,
             registry,
             data_provider,
-            conn_factory
+            conn_factory,
+            logger,
+            pending_transactions: Arc::new(DashSet::new())
         }
     }
 
     pub fn listen_for_new_blocks(router: Arc<ActionRouter>,
                                  registry: Arc<NodeRegistry>,
                                  data_provider: Arc<Box<dyn DataProvider>>,
-                                 conn_factory: Arc<Box<dyn ConnFactory>>) {
+                                 conn_factory: Arc<Box<dyn ConnFactory>>,
+                                 logger: Arc<Box<dyn Logger>>) {
         let config = Config::build()
             .expect("Couldn't build config for committer");
 
         let ip = config.ip_address;
         let addr = SocketAddr::new(ip, conns::COMMITTER_PORT);
         let listener = &conn_factory.get_listener(addr);
-        let thread_pool = server::ThreadPool::build(BLOCK_LISTENER_THREAD_COUNT)
+        let thread_pool = ThreadPool::build(BLOCK_LISTENER_THREAD_COUNT)
             .expect("Couldn't establish thread pool for committing new blocks");
 
-        let committer = Arc::new(Committer::init(config, router, registry, data_provider, conn_factory));
+        let committer = Arc::new(Committer::init(
+            config, router, registry, data_provider, conn_factory, logger));
 
         loop {
             match listener.accept() {
                 Err(_) => continue,
-                Ok((mut stream, _)) => {
+                Ok((stream, _)) => {
                     let clone = committer.clone();
                     Self::process_incoming_block(stream, clone, &thread_pool);
                 }
@@ -71,31 +77,24 @@ impl Committer {
         let _ = pool.execute(move || {
             let mut data: Vec<u8> = vec![];
             let _ = stream.read_to_end(&mut data);
+            stream.write_all(&acknowledge()).ok();
             let message = match deserialize_rmp_to::<Message>(&data) {
                 Ok(c) => c,
-                Err(_) => {
-                    stream.write_all(&messages::acknowledge()).ok();
-                    return;
-                }
+                Err(_) => { return; }
             };
 
-            // TODO: have to have a pending transactions DashMap to make sure we haven't already processed this transaction
-
-            committer.registry.send_to_all(data, &NodeRegistryType::Committer);
-            stream.write_all(&messages::acknowledge()).ok();
-
             let _ = match committer.validate_block_and_commit(message) {
-                Ok(()) => return,
-                Err(err) => return // TODO: log error
+                Ok(()) => committer.registry.send_to_all(data, &NodeRegistryType::Committer),
+                Err(err) => committer.logger.log(err.to_string())
             };
         });
     }
 
     fn validate_block_and_commit(&self, message: Message) -> Result<(), CommitterError> {
-        let Some(metadata) = &self.config.environment_metadata.get(&message.chain_id)
-            else { return Err(CommitterError::MissingEnvironmentMetadata(message.chain_id)) };
+        let Some(metadata) = &self.config.environment_metadata.get(&message.env_id)
+            else { return Err(CommitterError::MissingEnvironmentMetadata(message.env_id)) };
 
-        let commit = Self::validate_transaction_message(&message, &metadata)?;
+        let commit = self.validate_transaction_message(&message, &metadata)?;
         let locked_token = self.acquire_token(&commit, &metadata)?;
 
         let token_clone = locked_token.clone();
@@ -116,7 +115,7 @@ impl Committer {
         }
     }
 
-    fn validate_transaction_message(message: &Message, metadata: &EnvironmentMetadata)
+    fn validate_transaction_message(&self, message: &Message, metadata: &EnvironmentMetadata)
             -> Result<TransactionCommit, CommitterError> {
         let crypto_provider = match metadata.asym_crypto_provider.lock() {
             Ok(provider) => provider,
@@ -127,10 +126,20 @@ impl Committer {
             return Err(CommitterError::InvalidSignature);
         }
 
-        match deserialize_rmp_to::<TransactionCommit>(&message.body) {
-            Ok(commit) => Ok(commit),
-            Err(_) => Err(CommitterError::MalformedTransactionData)
+        let Ok(commit) = deserialize_rmp_to::<TransactionCommit>(&message.body) else {
+            return Err(CommitterError::MalformedTransactionData)
+        };
+
+        let _ = match self.pending_transactions.contains(&commit.trans_id) {
+            true => return Err(CommitterError::TransactionInProcess),
+            false => self.pending_transactions.insert(commit.trans_id.clone())
+        };
+
+        if let Ok(_) = self.data_provider.get_data(&commit.trans_id, &metadata.slush_partition_id) {
+            return Err(CommitterError::TransactionAlreadyProcessed);
         }
+
+        Ok(commit)
     }
 
     fn acquire_token(&self, commit: &TransactionCommit, metadata: &EnvironmentMetadata)
@@ -180,15 +189,21 @@ impl Committer {
             write_token.blockchain.add_block(block);
         }
 
-        self.data_provider.save_token(&info.token_id, token, &info.env_id)
-            .or_else(|err| Err(CommitterError::FromDataError(err)))
+        match self.data_provider.save_token(&info.token_id, token, &info.env_id) {
+            Err(err) => Err(CommitterError::FromDataError(err)),
+            Ok(_) => {
+                self.pending_transactions.remove(&trans_id);
+                Ok(())
+            }
+        }
     }
 
     fn queue_for_reconciliation(&self, block: Block, token: Arc<RwLock<Token>>) {
-
+        todo!()
     }
 }
 
+#[derive(Debug)]
 pub enum CommitterError {
     MissingEnvironmentMetadata(String),
     InvalidSignature,
@@ -196,5 +211,19 @@ pub enum CommitterError {
     TokenPoisoned,
     FromDataError(DataError),
     MalformedTransactionData,
+    TransactionInProcess,
+    TransactionAlreadyProcessed,
     FromValidationError(BlockValidationError),
 }
+
+impl CommitterError {
+
+}
+
+impl Display for CommitterError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl Error for CommitterError {}
