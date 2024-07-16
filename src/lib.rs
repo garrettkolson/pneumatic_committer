@@ -199,7 +199,13 @@ impl Committer {
     }
 
     fn queue_for_reconciliation(&self, block: Block, token: Arc<RwLock<Token>>) {
-        todo!()
+        let Ok(data) = serialize_to_bytes_rmp(&block)
+            else { return };
+
+        let _ = self.data_provider.save_data(
+            &block.signed_trans.transaction_id.into_bytes(),
+            data,
+            &self.config.reconciliation_partition_id);
     }
 }
 
@@ -214,10 +220,6 @@ pub enum CommitterError {
     TransactionInProcess,
     TransactionAlreadyProcessed,
     FromValidationError(BlockValidationError),
-}
-
-impl CommitterError {
-
 }
 
 impl Display for CommitterError {
