@@ -83,18 +83,21 @@ impl Committer {
                 Err(_) => { return; }
             };
 
-            let _ = match committer.validate_block_and_commit(message) {
-                Ok(()) => committer.registry.send_to_all(data, &NodeRegistryType::Committer),
-                Err(err) => committer.logger.log(err.to_string())
-            };
+            if let Err(err) = committer.validate_block_and_commit(message, data) {
+                committer.logger.log(err.to_string())
+            }
         });
     }
 
-    fn validate_block_and_commit(&self, message: Message) -> Result<(), CommitterError> {
+    fn validate_block_and_commit(&self, message: Message, raw_data: Vec<u8>) -> Result<(), CommitterError> {
         let Some(metadata) = &self.config.environment_metadata.get(&message.env_id)
-            else { return Err(CommitterError::MissingEnvironmentMetadata(message.env_id)) };
+            else {
+                self.registry.send_to_all(raw_data, &NodeRegistryType::Committer);
+                return Err(CommitterError::MissingEnvironmentMetadata(message.env_id))
+            };
 
         let commit = self.validate_transaction_message(&message, &metadata)?;
+        self.registry.send_to_all(raw_data, &NodeRegistryType::Committer);
         let locked_token = self.acquire_token(&commit, &metadata)?;
 
         let token_clone = locked_token.clone();
